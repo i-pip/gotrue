@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -12,8 +13,10 @@ import (
 	"github.com/gofrs/uuid"
 	jwt "github.com/golang-jwt/jwt"
 	"github.com/netlify/gotrue/api/provider"
+	"github.com/netlify/gotrue/conf"
 	"github.com/netlify/gotrue/models"
 	"github.com/netlify/gotrue/storage"
+	"github.com/netlify/gotrue/utilities"
 	"github.com/sirupsen/logrus"
 )
 
@@ -36,15 +39,16 @@ func (a *API) ExternalProviderRedirect(w http.ResponseWriter, r *http.Request) e
 	ctx := r.Context()
 	config := a.getConfig(ctx)
 
-	providerType := r.URL.Query().Get("provider")
-	scopes := r.URL.Query().Get("scopes")
+	query := r.URL.Query()
+	providerType := query.Get("provider")
+	scopes := query.Get("scopes")
 
-	p, err := a.Provider(ctx, providerType, scopes)
+	p, err := a.Provider(ctx, providerType, scopes, &query)
 	if err != nil {
 		return badRequestError("Unsupported provider: %+v", err).WithInternalError(err)
 	}
 
-	inviteToken := r.URL.Query().Get("invite_token")
+	inviteToken := query.Get("invite_token")
 	if inviteToken != "" {
 		_, userErr := models.FindUserByConfirmationToken(a.db, inviteToken)
 		if userErr != nil {
@@ -55,7 +59,7 @@ func (a *API) ExternalProviderRedirect(w http.ResponseWriter, r *http.Request) e
 		}
 	}
 
-	redirectURL := a.getRedirectURLOrReferrer(r, r.URL.Query().Get("redirect_to"))
+	redirectURL := a.getRedirectURLOrReferrer(r, query.Get("redirect_to"))
 	log := getLogEntry(r)
 	log.WithField("provider", providerType).Info("Redirecting to external provider")
 
@@ -154,24 +158,15 @@ func (a *API) internalExternalProviderCallback(w http.ResponseWriter, r *http.Re
 			// check if identity exists
 			if identity, terr = models.FindIdentityByIdAndProvider(tx, userData.Metadata.Subject, providerType); terr != nil {
 				if models.IsNotFoundError(terr) {
-					// search user using all available emails
-					for _, e := range userData.Emails {
-						if e.Verified || config.Mailer.Autoconfirm {
-							user, terr = models.FindUserByEmailAndAudience(tx, instanceID, e.Email, aud)
-							if terr != nil && !models.IsNotFoundError(terr) {
-								return internalServerError("Error checking for duplicate users").WithInternalError(terr)
-							}
-							if user != nil {
-								emailData = e
-								break
-							}
-						}
+					user, emailData, terr = a.getUserByVerifiedEmail(tx, config, userData.Emails, instanceID, aud)
+					if terr != nil && !models.IsNotFoundError(terr) {
+						return internalServerError("Error checking for existing users").WithInternalError(terr)
 					}
 					if user != nil {
 						if identity, terr = a.createNewIdentity(tx, user, providerType, identityData); terr != nil {
 							return terr
 						}
-						if terr = user.UpdateAppMetaDataProvider(tx); terr != nil {
+						if terr = user.UpdateAppMetaDataProviders(tx); terr != nil {
 							return terr
 						}
 					} else {
@@ -215,12 +210,25 @@ func (a *API) internalExternalProviderCallback(w http.ResponseWriter, r *http.Re
 				if terr != nil {
 					return terr
 				}
+				identity.IdentityData = identityData
 				if terr = tx.UpdateOnly(identity, "identity_data", "last_sign_in_at"); terr != nil {
 					return terr
 				}
-				if terr = user.UpdateAppMetaDataProvider(tx); terr != nil {
+				// email & verified status might have changed if identity's email changed
+				emailData = provider.Email{
+					Email:    userData.Metadata.Email,
+					Verified: userData.Metadata.EmailVerified,
+				}
+				if terr = user.UpdateUserMetaData(tx, identityData); terr != nil {
 					return terr
 				}
+				if terr = user.UpdateAppMetaDataProviders(tx); terr != nil {
+					return terr
+				}
+			}
+
+			if user.IsBanned() {
+				return unauthorizedError("User is unauthorized")
 			}
 
 			if !user.IsConfirmed() {
@@ -228,13 +236,18 @@ func (a *API) internalExternalProviderCallback(w http.ResponseWriter, r *http.Re
 					mailer := a.Mailer(ctx)
 					referrer := a.getReferrer(r)
 					if terr = sendConfirmation(tx, user, mailer, config.SMTP.MaxFrequency, referrer); terr != nil {
+						if errors.Is(terr, MaxFrequencyLimitError) {
+							return tooManyRequestsError("For security purposes, you can only request this once every minute")
+						}
 						return internalServerError("Error sending confirmation mail").WithInternalError(terr)
 					}
 					// email must be verified to issue a token
 					return nil
 				}
 
-				if terr := models.NewAuditLogEntry(tx, instanceID, user, models.UserSignedUpAction, nil); terr != nil {
+				if terr := models.NewAuditLogEntry(tx, instanceID, user, models.UserSignedUpAction, map[string]interface{}{
+					"provider": providerType,
+				}); terr != nil {
 					return terr
 				}
 				if terr = triggerEventHooks(ctx, tx, SignupEvent, user, instanceID, config); terr != nil {
@@ -246,7 +259,9 @@ func (a *API) internalExternalProviderCallback(w http.ResponseWriter, r *http.Re
 					return internalServerError("Error updating user").WithInternalError(terr)
 				}
 			} else {
-				if terr := models.NewAuditLogEntry(tx, instanceID, user, models.LoginAction, nil); terr != nil {
+				if terr := models.NewAuditLogEntry(tx, instanceID, user, models.LoginAction, map[string]interface{}{
+					"provider": providerType,
+				}); terr != nil {
 					return terr
 				}
 				if terr = triggerEventHooks(ctx, tx, LoginEvent, user, instanceID, config); terr != nil {
@@ -274,7 +289,14 @@ func (a *API) internalExternalProviderCallback(w http.ResponseWriter, r *http.Re
 		q.Set("expires_in", strconv.Itoa(token.ExpiresIn))
 		q.Set("refresh_token", token.RefreshToken)
 		rurl += "#" + q.Encode()
+
+		if err := a.setCookieTokens(config, token, false, w); err != nil {
+			return internalServerError("Failed to set JWT cookie. %s", err)
+		}
+	} else {
+		rurl = a.prepErrorRedirectURL(unauthorizedError("Unverified email with %v", providerType), r, rurl)
 	}
+
 	http.Redirect(w, r, rurl, http.StatusFound)
 	return nil
 }
@@ -313,14 +335,21 @@ func (a *API) processInvite(ctx context.Context, tx *storage.Connection, userDat
 	if _, err := a.createNewIdentity(tx, user, providerType, identityData); err != nil {
 		return nil, err
 	}
-	if err = user.UpdateAppMetaDataProvider(tx); err != nil {
+	if err = user.UpdateAppMetaData(tx, map[string]interface{}{
+		"provider": providerType,
+	}); err != nil {
+		return nil, err
+	}
+	if err = user.UpdateAppMetaDataProviders(tx); err != nil {
 		return nil, err
 	}
 	if err := user.UpdateUserMetaData(tx, identityData); err != nil {
 		return nil, internalServerError("Database error updating user").WithInternalError(err)
 	}
 
-	if err := models.NewAuditLogEntry(tx, instanceID, user, models.InviteAcceptedAction, nil); err != nil {
+	if err := models.NewAuditLogEntry(tx, instanceID, user, models.InviteAcceptedAction, map[string]interface{}{
+		"provider": providerType,
+	}); err != nil {
 		return nil, err
 	}
 	if err := triggerEventHooks(ctx, tx, SignupEvent, user, instanceID, config); err != nil {
@@ -356,7 +385,7 @@ func (a *API) loadExternalState(ctx context.Context, state string) (context.Cont
 }
 
 // Provider returns a Provider interface for the given name.
-func (a *API) Provider(ctx context.Context, name string, scopes string) (provider.Provider, error) {
+func (a *API) Provider(ctx context.Context, name string, scopes string, query *url.Values) (provider.Provider, error) {
 	config := a.getConfig(ctx)
 	name = strings.ToLower(name)
 
@@ -375,14 +404,28 @@ func (a *API) Provider(ctx context.Context, name string, scopes string) (provide
 		return provider.NewGitlabProvider(config.External.Gitlab, scopes)
 	case "google":
 		return provider.NewGoogleProvider(config.External.Google, scopes)
+	case "keycloak":
+		return provider.NewKeycloakProvider(config.External.Keycloak, scopes)
+	case "linkedin":
+		return provider.NewLinkedinProvider(config.External.Linkedin, scopes)
 	case "facebook":
 		return provider.NewFacebookProvider(config.External.Facebook, scopes)
+	case "notion":
+		return provider.NewNotionProvider(config.External.Notion)
+	case "spotify":
+		return provider.NewSpotifyProvider(config.External.Spotify, scopes)
+	case "slack":
+		return provider.NewSlackProvider(config.External.Slack, scopes)
 	case "twitch":
 		return provider.NewTwitchProvider(config.External.Twitch, scopes)
 	case "twitter":
 		return provider.NewTwitterProvider(config.External.Twitter, scopes)
+	case "workos":
+		return provider.NewWorkOSProvider(config.External.WorkOS, query)
 	case "saml":
 		return provider.NewSamlProvider(config.External.Saml, a.db, getInstanceID(ctx))
+	case "zoom":
+		return provider.NewZoomProvider(config.External.Zoom)
 	default:
 		return nil, fmt.Errorf("Provider %s could not be found", name)
 	}
@@ -423,8 +466,18 @@ func getErrorQueryString(err error, errorID string, log logrus.FieldLogger) *url
 	case ErrorCause:
 		return getErrorQueryString(e.Cause(), errorID, log)
 	default:
-		q.Set("error", "server_error")
-		q.Set("error_description", err.Error())
+		error_type, error_description := "server_error", err.Error()
+
+		// Provide better error messages for certain user-triggered Postgres errors.
+		if pgErr := utilities.NewPostgresError(e); pgErr != nil {
+			error_description = pgErr.Message
+			if oauthErrorType, ok := oauthErrorMap[pgErr.HttpStatusCode]; ok {
+				error_type = oauthErrorType
+			}
+		}
+
+		q.Set("error", error_type)
+		q.Set("error_description", error_description)
 	}
 	return &q
 }
@@ -459,4 +512,25 @@ func (a *API) createNewIdentity(conn *storage.Connection, user *models.User, pro
 	}
 
 	return identity, nil
+}
+
+// getUserByVerifiedEmail checks if one of the verified emails already belongs to a user
+func (a *API) getUserByVerifiedEmail(tx *storage.Connection, config *conf.Configuration, emails []provider.Email, instanceID uuid.UUID, aud string) (*models.User, provider.Email, error) {
+	var user *models.User
+	var emailData provider.Email
+	var err error
+
+	for _, e := range emails {
+		if e.Verified || config.Mailer.Autoconfirm {
+			user, err = models.FindUserByEmailAndAudience(tx, instanceID, e.Email, aud)
+			if err != nil && !models.IsNotFoundError(err) {
+				return user, emailData, err
+			}
+			if user != nil {
+				emailData = e
+				break
+			}
+		}
+	}
+	return user, emailData, err
 }

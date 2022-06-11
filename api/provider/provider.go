@@ -1,19 +1,38 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"os"
+	"time"
 
 	"golang.org/x/oauth2"
 )
 
+var defaultTimeout time.Duration = time.Second * 10
+
+func init() {
+	timeoutStr := os.Getenv("GOTRUE_INTERNAL_HTTP_TIMEOUT")
+	if timeoutStr != "" {
+		if timeout, err := time.ParseDuration(timeoutStr); err != nil {
+			log.Fatalf("error loading GOTRUE_INTERNAL_HTTP_TIMEOUT: %v", err.Error())
+		} else if timeout != 0 {
+			defaultTimeout = timeout
+		}
+	}
+}
+
 type Claims struct {
 	// Reserved claims
-	Issuer  string `json:"iss,omitempty"`
-	Subject string `json:"sub,omitempty"`
-	Aud     string `json:"aud,omitempty"`
-	Iat     string `json:"iat,omitempty"`
-	Exp     string `json:"exp,omitempty"`
+	Issuer  string  `json:"iss,omitempty"`
+	Subject string  `json:"sub,omitempty"`
+	Aud     string  `json:"aud,omitempty"`
+	Iat     float64 `json:"iat,omitempty"`
+	Exp     float64 `json:"exp,omitempty"`
 
 	// Default profile claims
 	Name              string `json:"name,omitempty"`
@@ -100,11 +119,20 @@ func chooseHost(base, defaultHost string) string {
 
 func makeRequest(ctx context.Context, tok *oauth2.Token, g *oauth2.Config, url string, dst interface{}) error {
 	client := g.Client(ctx, tok)
+	client.Timeout = defaultTimeout
 	res, err := client.Get(url)
 	if err != nil {
 		return err
 	}
 	defer res.Body.Close()
+
+	bodyBytes, _ := ioutil.ReadAll(res.Body)
+	defer res.Body.Close()
+	res.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes))
+
+	if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
+		return httpError(res.StatusCode, string(bodyBytes))
+	}
 
 	if err := json.NewDecoder(res.Body).Decode(dst); err != nil {
 		return err

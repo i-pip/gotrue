@@ -6,13 +6,25 @@ API service for handling user registration and authentication for JAM projects.
 It's based on OAuth2 and JWT and will handle user signup, authentication and custom
 user data.
 
-## Quick Start 
-Create a `.env` file to store your own custom env vars. See [`example.env`](example.env) 
-```sh
-./hack/postgresd.sh
-make build
-./gotrue
+## Quick Start
+
+Create a `.env` file to store your own custom env vars. See [`example.env`](example.env)
+
+1. Start the local postgres database in a postgres container: `./hack/postgresd.sh` 
+2. Build the gotrue binary: `make build` . You should see an output like this:
 ```
+go build -ldflags "-X github.com/supabase/gotrue/cmd.Version=`git rev-parse HEAD`"
+GOOS=linux GOARCH=arm64 go build -ldflags "-X github.com/supabase/gotrue/cmd.Version=`git rev-parse HEAD`" -o gotrue-arm64
+```
+3. Execute the gotrue binary: `./gotrue`
+
+### If you have docker installed...
+Create a `.env.docker` file to store your own custom env vars. See [`example.docker.env`](example.docker.env)
+
+1. `make build`
+2. `make dev`
+3. `docker ps` should show 2 docker containers (`gotrue_postgresql` and `gotrue_gotrue`)
+4. That's it! Visit the [health checkendpoint](http://localhost:9999/health) to confirm that gotrue is running. 
 
 ## Configuration
 
@@ -31,7 +43,9 @@ The base URL your site is located at. Currently used in combination with other s
 
 `URI_ALLOW_LIST` - `string`
 
-A comma separated list of URIs (e.g. "https://supabase.io/welcome,io.supabase.gotruedemo://logincallback") which are permitted as valid `redirect_to` destinations, in addition to SITE_URL. Defaults to [].
+A comma separated list of URIs (e.g. `"https://foo.example.com,https://*.foo.example.com,https://bar.example.com"`) which are permitted as valid `redirect_to` destinations. Defaults to []. Supports wildcard matching through globbing. e.g. `https://*.foo.example.com` will allow `https://a.foo.example.com` and `https://b.foo.example.com` to be accepted. Globbing is also supported on subdomains. e.g. `https://foo.example.com/*` will allow `https://foo.example.com/page1` and `https://foo.example.com/page2` to be accepted.
+
+For more common glob patterns, check out the [following link](https://pkg.go.dev/github.com/gobwas/glob#Compile).
 
 `OPERATOR_TOKEN` - `string` _Multi-instance mode only_
 
@@ -56,12 +70,21 @@ Header on which to rate limit the `/token` endpoint.
 
 `GOTRUE_RATE_LIMIT_EMAIL_SENT` - `string`
 
-Rate limit the number of emails sent per hr on the following endpoints: `/signup`, `/invite`, `/magiclink`, `/recover`, `/otp`, & `/user`. 
+Rate limit the number of emails sent per hr on the following endpoints: `/signup`, `/invite`, `/magiclink`, `/recover`, `/otp`, & `/user`.
 
-`PASSWORD_MIN_LENGTH` - `int`
+`GOTRUE_PASSWORD_MIN_LENGTH` - `int`
 
 Minimum password length, defaults to 6.
 
+`GOTRUE_SECURITY_REFRESH_TOKEN_ROTATION_ENABLED` - `bool`
+
+If refresh token rotation is enabled, gotrue will automatically detect malicious attempts to reuse a revoked refresh token. When a malicious attempt is detected, gotrue immediately revokes all tokens that descended from the offending token.
+
+`GOTRUE_SECURITY_REFRESH_TOKEN_REUSE_INTERVAL` - `string`
+
+This setting is only applicable if `GOTRUE_SECURITY_REFRESH_TOKEN_ROTATION_ENABLED` is enabled. The reuse interval for a refresh token allows for exchanging the refresh token multiple times during the interval to support concurrency or offline issues. During the reuse interval, gotrue will not consider using a revoked token as a malicious attempt and will simply return the child refresh token. 
+
+Only the previous revoked token can be reused. Using an old refresh token way before the current valid refresh token will trigger the reuse detection. 
 ### API
 
 ```properties
@@ -100,6 +123,10 @@ Chooses what dialect of database you want. Must be `mysql`.
 
 Connection string for the database.
 
+`GOTRUE_DB_MAX_POOL_SIZE` - `int`
+
+Sets the maximum number of open connections to the database. Defaults to 0 which is equivalent to an "unlimited" number of connections.
+
 `DB_NAMESPACE` - `string`
 
 Adds a prefix to all table names.
@@ -109,8 +136,8 @@ Adds a prefix to all table names.
 Migrations are not applied automatically, so you will need to run them after
 you've built gotrue.
 
-* If built locally: `./gotrue migrate`
-* Using Docker: `docker run --rm gotrue gotrue migrate`
+- If built locally: `./gotrue migrate`
+- Using Docker: `docker run --rm gotrue gotrue migrate`
 
 ### Logging
 
@@ -128,6 +155,7 @@ Controls what log levels are output. Choose from `panic`, `fatal`, `error`, `war
 If you wish logs to be written to a file, set `log_file` to a valid file path.
 
 ### Opentracing
+
 Currently, only the Datadog tracer is supported.
 
 ```properties
@@ -188,7 +216,7 @@ The default group to assign all new users to.
 
 ### External Authentication Providers
 
-We support `apple`, `azure`, `bitbucket`, `discord`, `facebook`, `github`, `gitlab`, `google`, `twitch` and `twitter` for external authentication.
+We support `apple`, `azure`, `bitbucket`, `discord`, `facebook`, `github`, `gitlab`, `google`, `keycloak`, `linkedin`, `notion`, `spotify`, `slack`, `twitch`, `twitter` and `workos` for external authentication.
 
 Use the names as the keys underneath `external` to configure each separately.
 
@@ -196,6 +224,7 @@ Use the names as the keys underneath `external` to configure each separately.
 GOTRUE_EXTERNAL_GITHUB_ENABLED=true
 GOTRUE_EXTERNAL_GITHUB_CLIENT_ID=myappclientid
 GOTRUE_EXTERNAL_GITHUB_SECRET=clientsecretvaluessssh
+GOTRUE_EXTERNAL_GITHUB_REDIRECT_URI=http://localhost:3000/callback
 ```
 
 No external providers are required, but you must provide the required values if you choose to enable any.
@@ -218,11 +247,12 @@ The URI a OAuth2 provider will redirect to with the `code` and `state` values.
 
 `EXTERNAL_X_URL` - `string`
 
-The base URL used for constructing the URLs to request authorization and access tokens. Used by `gitlab` only. Defaults to `https://gitlab.com`.
+The base URL used for constructing the URLs to request authorization and access tokens. Used by `gitlab` and `keycloak`. For `gitlab` it defaults to `https://gitlab.com`. For `keycloak` you need to set this to your instance, for example: `https://keycloak.example.com/auth/realms/myrealm`
 
 #### Apple OAuth
 
 To try out external authentication with Apple locally, you will need to do the following:
+
 1. Remap localhost to \<my_custom_dns \> in your `/etc/hosts` config.
 2. Configure gotrue to serve HTTPS traffic over localhost by replacing `ListenAndServe` in [api.go](api/api.go) with:
    ```
@@ -298,6 +328,10 @@ Sets the name of the sender. Defaults to the `SMTP_ADMIN_EMAIL` if not used.
 
 If you do not require email confirmation, you may set this to `true`. Defaults to `false`.
 
+`MAILER_OTP_EXP` - `number`
+
+Controls the duration an email link or otp is valid for.
+
 `MAILER_URLPATHS_INVITE` - `string`
 
 URL path to use in the user invite email. Defaults to `/`.
@@ -344,7 +378,10 @@ Default Content (if template is unavailable):
 ```html
 <h2>You have been invited</h2>
 
-<p>You have been invited to create a user on {{ .SiteURL }}. Follow this link to accept the invite:</p>
+<p>
+  You have been invited to create a user on {{ .SiteURL }}. Follow this link to
+  accept the invite:
+</p>
 <p><a href="{{ .ConfirmationURL }}">Accept the invite</a></p>
 ```
 
@@ -400,7 +437,10 @@ Default Content (if template is unavailable):
 ```html
 <h2>Confirm Change of Email</h2>
 
-<p>Follow this link to confirm the update of your email from {{ .Email }} to {{ .NewEmail }}:</p>
+<p>
+  Follow this link to confirm the update of your email from {{ .Email }} to {{
+  .NewEmail }}:
+</p>
 <p><a href="{{ .ConfirmationURL }}">Change Email</a></p>
 ```
 
@@ -410,7 +450,7 @@ Url of the webhook receiver endpoint. This will be called when events like `vali
 
 `WEBHOOK_SECRET` - `string`
 
-Shared secret to authorize webhook requests. This secret signs the [JSON Web Signature](https://tools.ietf.org/html/draft-ietf-jose-json-web-signature-41) of the request. You *should* use this to verify the integrity of the request. Otherwise others can feed your webhook receiver with fake data.
+Shared secret to authorize webhook requests. This secret signs the [JSON Web Signature](https://tools.ietf.org/html/draft-ietf-jose-json-web-signature-41) of the request. You _should_ use this to verify the integrity of the request. Otherwise others can feed your webhook receiver with fake data.
 
 `WEBHOOK_RETRIES` - `number`
 
@@ -437,23 +477,29 @@ Controls the minimum amount of time that must pass before sending another sms ot
 
 `SMS_OTP_EXP` - `number`
 
-Controls the duration an sms otp is valid for. 
+Controls the duration an sms otp is valid for.
 
 `SMS_OTP_LENGTH` - `number`
 
-Controls the number of digits of the sms otp sent. 
+Controls the number of digits of the sms otp sent.
 
 `SMS_PROVIDER` - `string`
 
-for now only option is: `twilio`
+Available options are: `twilio`, `messagebird`, `textlocal`, and `vonage`
 
 Then you can use your [twilio credentials](https://www.twilio.com/docs/usage/requests-to-twilio#credentials):
+
 - `SMS_TWILIO_ACCOUNT_SID`
 - `SMS_TWILIO_AUTH_TOKEN`
 - `SMS_TWILIO_MESSAGE_SERVICE_SID` - can be set to your twilio sender mobile number
 
+Or Messagebird credentials, which can be obtained in the [Dashboard](https://dashboard.messagebird.com/en/developers/access):
+- `SMS_MESSAGEBIRD_ACCESS_KEY` - your Messagebird access key
+- `SMS_MESSAGEBIRD_ORIGINATOR` - SMS sender (your Messagebird phone number with + or company name)
+
 ### CAPTCHA
-* If enabled, CAPTCHA will check the request body for the `hcaptcha_token` field and make a verification request to the CAPTCHA provider.
+
+- If enabled, CAPTCHA will check the request body for the `hcaptcha_token` field and make a verification request to the CAPTCHA provider.
 
 `SECURITY_CAPTCHA_ENABLED` - `string`
 
@@ -463,9 +509,16 @@ Whether captcha middleware is enabled
 
 for now the only option supported is: `hcaptcha`
 
-`SECURITY_CAPTCHA_SECRET` - `string`
+- `SECURITY_CAPTCHA_SECRET` - `string`
+- `SECURITY_CAPTCHA_TIMEOUT` - `string`
 
 Retrieve from hcaptcha account
+
+### Reauthentication
+
+`SECURITY_UPDATE_PASSWORD_REQUIRE_REAUTHENTICATION` - `bool`
+
+Enforce reauthentication on password update.
 
 ## Endpoints
 
@@ -473,386 +526,465 @@ GoTrue exposes the following endpoints:
 
 ### **GET /settings**
 
-  Returns the publicly available settings for this gotrue instance.
+Returns the publicly available settings for this gotrue instance.
 
-  ```json
-  {
-    "external": {
-      "apple": true,
-      "azure": true,
-      "bitbucket": true,
-      "discord": true,
-      "facebook": true,
-      "github": true,
-      "gitlab": true,
-      "google": true,
-      "twitch": true,
-      "twitter": true
-    },
-    "disable_signup": false,
-    "autoconfirm": false
-  }
-  ```
+```json
+{
+  "external": {
+    "apple": true,
+    "azure": true,
+    "bitbucket": true,
+    "discord": true,
+    "facebook": true,
+    "github": true,
+    "gitlab": true,
+    "google": true,
+    "keycloak": true,
+    "linkedin": true,
+    "notion": true,
+    "slack": true,
+    "spotify": true,
+    "twitch": true,
+    "twitter": true,
+    "workos": true,
+  },
+  "disable_signup": false,
+  "autoconfirm": false
+}
+```
+
+### **POST, PUT /admin/users/<user_id>**
+
+Creates (POST) or Updates (PUT) the user based on the `user_id` specified. The `ban_duration` field accepts the following time units: "ns", "us", "ms", "s", "m", "h". See [`time.ParseDuration`](https://pkg.go.dev/time#ParseDuration) for more details on the format used.
+
+```js
+headers:
+{
+  "Authorization": "Bearer eyJhbGciOiJI...M3A90LCkxxtX9oNP9KZO" // admin role required
+}
+
+body:
+{
+  "role": "test-user",
+  "email": "email@example.com",
+  "phone": "12345678",
+  "password": "secret", // only if type = signup
+  "email_confirm": true,
+  "phone_confirm": true,
+  "user_metadata": {},
+  "app_metadata": {},
+  "ban_duration": "24h" or "none" // to unban a user
+}
+```
 
 ### **POST /admin/generate_link**
-  Returns the corresponding email action link based on the type specified.
 
-  ```js
-  headers: 
-  {
-    "Authorization": "Bearer eyJhbGciOiJI...M3A90LCkxxtX9oNP9KZO" // admin role required
-  }
+Returns the corresponding email action link based on the type specified.
 
-  body: 
-  {
-    "type": "signup" or "magiclink" or "recovery" or "invite",
-    "email": "email@example.com",
-    "password": "secret", // only if type = signup
-    "data": {
-      ...
-    }, // only if type = signup
-    "redirect_to": "https://supabase.io" // Redirect URL to send the user to after an email action. Defaults to SITE_URL. 
+```js
+headers:
+{
+  "Authorization": "Bearer eyJhbGciOiJI...M3A90LCkxxtX9oNP9KZO" // admin role required
+}
 
-  }
-  ```
-  Returns
-  ```js
-  {
-    "action_link": "http://localhost:9999/verify?token=TOKEN&type=TYPE&redirect_to=REDIRECT_URL",
+body:
+{
+  "type": "signup" or "magiclink" or "recovery" or "invite",
+  "email": "email@example.com",
+  "password": "secret", // only if type = signup
+  "data": {
     ...
-  }
-  ```
+  }, // only if type = signup
+  "redirect_to": "https://supabase.io" // Redirect URL to send the user to after an email action. Defaults to SITE_URL.
+
+}
+```
+
+Returns
+
+```js
+{
+  "action_link": "http://localhost:9999/verify?token=TOKEN&type=TYPE&redirect_to=REDIRECT_URL",
+  ...
+}
+```
 
 ### **POST /signup**
 
-  Register a new user with an email and password.
+Register a new user with an email and password.
 
-  ```js
-  {
-    "email": "email@example.com",
-    "password": "secret"
-  }
-  ```
+```js
+{
+  "email": "email@example.com",
+  "password": "secret"
+}
+```
 
-  Returns:
+returns:
 
-  ```json
-  {
-    "id": "11111111-2222-3333-4444-5555555555555",
-    "email": "email@example.com",
-    "confirmation_sent_at": "2016-05-15T20:49:40.882805774-07:00",
-    "created_at": "2016-05-15T19:53:12.368652374-07:00",
-    "updated_at": "2016-05-15T19:53:12.368652374-07:00"
-  }
-  ```
+```json
+{
+  "id": "11111111-2222-3333-4444-5555555555555",
+  "email": "email@example.com",
+  "confirmation_sent_at": "2016-05-15T20:49:40.882805774-07:00",
+  "created_at": "2016-05-15T19:53:12.368652374-07:00",
+  "updated_at": "2016-05-15T19:53:12.368652374-07:00"
+}
 
-  Register a new user with a phone number and password.
+// if sign up is a duplicate then faux data will be returned
+// as to not leak information about whether a given email
+// has an account with your service or not
+```
 
-  ```js
-  {
-    "phone": "12345678", // follows the E.164 format
-    "password": "secret"
-  }
-  ```
+Register a new user with a phone number and password.
 
-  Returns:
+```js
+{
+  "phone": "12345678", // follows the E.164 format
+  "password": "secret"
+}
+```
 
-  ```json
-  {
-    "id": "11111111-2222-3333-4444-5555555555555",
-    "phone": "12345678",
-    "confirmation_sent_at": "2016-05-15T20:49:40.882805774-07:00",
-    "created_at": "2016-05-15T19:53:12.368652374-07:00",
-    "updated_at": "2016-05-15T19:53:12.368652374-07:00"
-  }
-  ```
+Returns:
+
+```json
+{
+  "id": "11111111-2222-3333-4444-5555555555555", // if duplicate sign up, this ID will be faux
+  "phone": "12345678",
+  "confirmation_sent_at": "2016-05-15T20:49:40.882805774-07:00",
+  "created_at": "2016-05-15T19:53:12.368652374-07:00",
+  "updated_at": "2016-05-15T19:53:12.368652374-07:00"
+}
+```
+
+if AUTOCONFIRM is enabled and the sign up is a duplicate, then the endpoint will return:
+```
+{
+  "code":400,
+  "msg":"User already registered"
+}
+```
 
 ### **POST /invite**
 
-  Invites a new user with an email.
-  This endpoint requires the `service_role` or `supabase_admin` JWT set as an Auth Bearer header:
+Invites a new user with an email.
+This endpoint requires the `service_role` or `supabase_admin` JWT set as an Auth Bearer header:
 
-  e.g.
-  ```json
-  headers: {
-    "Authorization" : "Bearer eyJhbGciOiJI...M3A90LCkxxtX9oNP9KZO"
-  }
-  ```
+e.g.
 
-  ```json
-  {
-    "email": "email@example.com"
-  }
-  ```
+```json
+headers: {
+  "Authorization" : "Bearer eyJhbGciOiJI...M3A90LCkxxtX9oNP9KZO"
+}
+```
 
-  Returns:
+```json
+{
+  "email": "email@example.com"
+}
+```
 
-  ```json
-  {
-    "id": "11111111-2222-3333-4444-5555555555555",
-    "email": "email@example.com",
-    "confirmation_sent_at": "2016-05-15T20:49:40.882805774-07:00",
-    "created_at": "2016-05-15T19:53:12.368652374-07:00",
-    "updated_at": "2016-05-15T19:53:12.368652374-07:00",
-    "invited_at": "2016-05-15T19:53:12.368652374-07:00"
-  }
-  ```
+Returns:
+
+```json
+{
+  "id": "11111111-2222-3333-4444-5555555555555",
+  "email": "email@example.com",
+  "confirmation_sent_at": "2016-05-15T20:49:40.882805774-07:00",
+  "created_at": "2016-05-15T19:53:12.368652374-07:00",
+  "updated_at": "2016-05-15T19:53:12.368652374-07:00",
+  "invited_at": "2016-05-15T19:53:12.368652374-07:00"
+}
+```
 
 ### **POST /verify**
 
-  Verify a registration or a password recovery. Type can be `signup` or `recovery` or `invite` 
-  and the `token` is a token returned from either `/signup` or `/recover`.
+Verify a registration or a password recovery. Type can be `signup` or `recovery` or `invite`
+and the `token` is a token returned from either `/signup` or `/recover`.
 
-  ```json
-  {
-    "type": "signup",
-    "token": "confirmation-code-delivered-in-email"
-  }
-  ```
+```json
+{
+  "type": "signup",
+  "token": "confirmation-code-delivered-in-email"
+}
+```
 
-  `password` is required for signup verification if no existing password exists.
+`password` is required for signup verification if no existing password exists.
 
-  Returns:
+Returns:
 
-  ```json
-  {
-    "access_token": "jwt-token-representing-the-user",
-    "token_type": "bearer",
-    "expires_in": 3600,
-    "refresh_token": "a-refresh-token",
-    "type": "signup | recovery | invite"
-  }
-  ```
+```json
+{
+  "access_token": "jwt-token-representing-the-user",
+  "token_type": "bearer",
+  "expires_in": 3600,
+  "refresh_token": "a-refresh-token",
+  "type": "signup | recovery | invite"
+}
+```
 
-  Verify a phone signup or sms otp. Type should be set to `sms`.
-  ```json
-  {
-    "type": "sms",
-    "token": "confirmation-otp-delivered-in-sms",
-    "redirect_to": "https://supabase.io",
-    "phone": "phone-number-sms-otp-was-delivered-to"
-  }
-  ```
+Verify a phone signup or sms otp. Type should be set to `sms`.
 
-  Returns:
+```json
+{
+  "type": "sms",
+  "token": "confirmation-otp-delivered-in-sms",
+  "redirect_to": "https://supabase.io",
+  "phone": "phone-number-sms-otp-was-delivered-to"
+}
+```
 
-  ```json
-  {
-    "access_token": "jwt-token-representing-the-user",
-    "token_type": "bearer",
-    "expires_in": 3600,
-    "refresh_token": "a-refresh-token"
-  }
-  ```
+Returns:
+
+```json
+{
+  "access_token": "jwt-token-representing-the-user",
+  "token_type": "bearer",
+  "expires_in": 3600,
+  "refresh_token": "a-refresh-token"
+}
+```
 
 ### **GET /verify**
 
-  Verify a registration or a password recovery. Type can be `signup` or `recovery` or `magiclink` or `invite`
-  and the `token` is a token returned from either `/signup` or `/recover` or `/magiclink`.
+Verify a registration or a password recovery. Type can be `signup` or `recovery` or `magiclink` or `invite`
+and the `token` is a token returned from either `/signup` or `/recover` or `/magiclink`.
 
-  query params:
-  ```json
-  {
-    "type": "signup",
-    "token": "confirmation-code-delivered-in-email",
-    "redirect_to": "https://supabase.io"
-  }
-  ```
+query params:
 
-  User will be logged in and redirected to:
+```json
+{
+  "type": "signup",
+  "token": "confirmation-code-delivered-in-email",
+  "redirect_to": "https://supabase.io"
+}
+```
 
-  ```json
-  SITE_URL/#access_token=jwt-token-representing-the-user&token_type=bearer&expires_in=3600&refresh_token=a-refresh-token&type=invite
-  ```
+User will be logged in and redirected to:
 
-  Your app should detect the query params in the fragment and use them to set the session (supabase-js does this automatically)
+```json
+SITE_URL/#access_token=jwt-token-representing-the-user&token_type=bearer&expires_in=3600&refresh_token=a-refresh-token&type=invite
+```
 
-  You can use the `type` param to redirect the user to a password set form in the case of `invite` or `recovery`,
-  or show an account confirmed/welcome message in the case of `signup`, or direct them to some additional onboarding flow
+Your app should detect the query params in the fragment and use them to set the session (supabase-js does this automatically)
+
+You can use the `type` param to redirect the user to a password set form in the case of `invite` or `recovery`,
+or show an account confirmed/welcome message in the case of `signup`, or direct them to some additional onboarding flow
 
 ### **POST /otp**
-  One-Time-Password. Will deliver a magiclink or sms otp to the user depending on whether the request body contains an "email" or "phone" key. 
 
-  ```js
-  {
-    "phone": "12345678" // follows the E.164 format
-  }
+One-Time-Password. Will deliver a magiclink or sms otp to the user depending on whether the request body contains an "email" or "phone" key.
 
-  OR 
+If `"create_user": true`, user will not be automatically signed up if the user doesn't exist.
 
-  // exactly the same as /magiclink 
-  {
-    "email": "email@example.com"
-  }
-  ```
-  Returns:
-  ```
-  {}
-  ```
+```js
+{
+  "phone": "12345678" // follows the E.164 format
+  "create_user": true
+}
+
+OR
+
+// exactly the same as /magiclink
+{
+  "email": "email@example.com"
+  "create_user": true
+}
+```
+
+Returns:
+
+```
+{}
+```
 
 ### **POST /magiclink** (recommended to use /otp instead. See above.)
 
-  Magic Link. Will deliver a link (e.g. `/verify?type=magiclink&token=fgtyuf68ddqdaDd`) to the user based on
-  email address which they can use to redeem an access_token.
+Magic Link. Will deliver a link (e.g. `/verify?type=magiclink&token=fgtyuf68ddqdaDd`) to the user based on
+email address which they can use to redeem an access_token.
 
-  By default Magic Links can only be sent once every 60 seconds
+By default Magic Links can only be sent once every 60 seconds
 
-  ```json
-  {
-    "email": "email@example.com"
-  }
-  ```
+```json
+{
+  "email": "email@example.com"
+}
+```
 
-  Returns:
+Returns:
 
-  ```json
-  {}
-  ```
+```json
+{}
+```
 
-  when clicked the magic link will redirect the user to `<SITE_URL>#access_token=x&refresh_token=y&expires_in=z&token_type=bearer&type=magiclink` (see `/verify` above)
+when clicked the magic link will redirect the user to `<SITE_URL>#access_token=x&refresh_token=y&expires_in=z&token_type=bearer&type=magiclink` (see `/verify` above)
 
 ### **POST /recover**
 
-  Password recovery. Will deliver a password recovery mail to the user based on
-  email address.
+Password recovery. Will deliver a password recovery mail to the user based on
+email address.
 
-  By default recovery links can only be sent once every 60 seconds
+By default recovery links can only be sent once every 60 seconds
 
-  ```json
-  {
-    "email": "email@example.com"
-  }
-  ```
+```json
+{
+  "email": "email@example.com"
+}
+```
 
-  Returns:
+Returns:
 
-  ```json
-  {}
-  ```
+```json
+{}
+```
 
 ### **POST /token**
 
-  This is an OAuth2 endpoint that currently implements
-  the password and refresh_token grant types
+This is an OAuth2 endpoint that currently implements
+the password and refresh_token grant types
 
-  query params:
-  ```
-  ?grant_type=password
-  ```
+query params:
 
-  body:
-  ```json
-  // Email login
-  {
-    "email": "name@domain.com",
-    "password": "somepassword"
-  }
-  
-  // Phone login
-  {
-    "phone": "12345678",
-    "password": "somepassword"
-  }
-  ```
+```
+?grant_type=password
+```
 
-  or
+body:
 
-  query params:
-  ```
-  grant_type=refresh_token
-  ```
+```json
+// Email login
+{
+  "email": "name@domain.com",
+  "password": "somepassword"
+}
 
-  body:
-  ```json
-  {
-    "refresh_token": "a-refresh-token"
-  }
-  ```
+// Phone login
+{
+  "phone": "12345678",
+  "password": "somepassword"
+}
+```
 
-  Once you have an access token, you can access the methods requiring authentication
-  by settings the `Authorization: Bearer YOUR_ACCESS_TOKEN_HERE` header.
+or
 
-  Returns:
+query params:
 
-  ```json
-  {
-    "access_token": "jwt-token-representing-the-user",
-    "token_type": "bearer",
-    "expires_in": 3600,
-    "refresh_token": "a-refresh-token"
-  }
-  ```
+```
+grant_type=refresh_token
+```
+
+body:
+
+```json
+{
+  "refresh_token": "a-refresh-token"
+}
+```
+
+Once you have an access token, you can access the methods requiring authentication
+by settings the `Authorization: Bearer YOUR_ACCESS_TOKEN_HERE` header.
+
+Returns:
+
+```json
+{
+  "access_token": "jwt-token-representing-the-user",
+  "token_type": "bearer",
+  "expires_in": 3600,
+  "refresh_token": "a-refresh-token"
+}
+```
 
 ### **GET /user**
 
-  Get the JSON object for the logged in user (requires authentication)
+Get the JSON object for the logged in user (requires authentication)
 
-  Returns:
+Returns:
 
-  ```json
-  {
-    "id": "11111111-2222-3333-4444-5555555555555",
-    "email": "email@example.com",
-    "confirmation_sent_at": "2016-05-15T20:49:40.882805774-07:00",
-    "created_at": "2016-05-15T19:53:12.368652374-07:00",
-    "updated_at": "2016-05-15T19:53:12.368652374-07:00"
-  }
-  ```
+```json
+{
+  "id": "11111111-2222-3333-4444-5555555555555",
+  "email": "email@example.com",
+  "confirmation_sent_at": "2016-05-15T20:49:40.882805774-07:00",
+  "created_at": "2016-05-15T19:53:12.368652374-07:00",
+  "updated_at": "2016-05-15T19:53:12.368652374-07:00"
+}
+```
 
 ### **PUT /user**
 
-  Update a user (Requires authentication). Apart from changing email/password, this
-  method can be used to set custom user data. Changing the email will result in a magiclink being sent out.
+Update a user (Requires authentication). Apart from changing email/password, this
+method can be used to set custom user data. Changing the email will result in a magiclink being sent out.
 
-  ```json
-  {
-    "email": "new-email@example.com",
-    "password": "new-password",
-    "data": {
-      "key": "value",
-      "number": 10,
-      "admin": false
-    }
+```json
+{
+  "email": "new-email@example.com",
+  "password": "new-password",
+  "data": {
+    "key": "value",
+    "number": 10,
+    "admin": false
   }
-  ```
+}
+```
 
-  Returns:
+Returns:
 
-  ```json
-  {
-    "id": "11111111-2222-3333-4444-5555555555555",
-    "email": "email@example.com",
-    "email_change_sent_at": "2016-05-15T20:49:40.882805774-07:00",
-    "created_at": "2016-05-15T19:53:12.368652374-07:00",
-    "updated_at": "2016-05-15T19:53:12.368652374-07:00"
-  }
-  ```
+```json
+{
+  "id": "11111111-2222-3333-4444-5555555555555",
+  "email": "email@example.com",
+  "email_change_sent_at": "2016-05-15T20:49:40.882805774-07:00",
+  "created_at": "2016-05-15T19:53:12.368652374-07:00",
+  "updated_at": "2016-05-15T19:53:12.368652374-07:00"
+}
+```
+
+If `GOTRUE_SECURITY_UPDATE_PASSWORD_REQUIRE_REAUTHENTICATION` is enabled, the user will need to reauthenticate first. 
+
+```json
+{
+  "password": "new-password",
+  "nonce": "123456",
+}
+```
+
+### **GET /reauthenticate**
+
+Sends a nonce to the user's email (preferred) or phone. This endpoint requires the user to be logged in / authenticated first. The user needs to have either an email or phone number for the nonce to be sent successfully.
+
+```json
+headers: {
+  "Authorization" : "Bearer eyJhbGciOiJI...M3A90LCkxxtX9oNP9KZO"
+}
+```
 
 ### **POST /logout**
 
-  Logout a user (Requires authentication).
+Logout a user (Requires authentication).
 
-  This will revoke all refresh tokens for the user. Remember that the JWT tokens
-  will still be valid for stateless auth until they expires.
-
+This will revoke all refresh tokens for the user. Remember that the JWT tokens
+will still be valid for stateless auth until they expires.
 
 ### **GET /authorize**
 
-  Get access_token from external oauth provider
+Get access_token from external oauth provider
 
-  query params:
-  ```
-  provider=apple | azure | bitbucket | discord | facebook | github | gitlab | google | twitch | twitter
-  scopes=<optional additional scopes depending on the provider (email and name are requested by default)>
-  ```
+query params:
 
-  Redirects to provider and then to `/callback`
+```
+provider=apple | azure | bitbucket | discord | facebook | github | gitlab | google | keycloak | linkedin | notion | slack | spotify | twitch | twitter | workos
 
-  For apple specific setup see: https://github.com/supabase/gotrue#apple-oauth
+scopes=<optional additional scopes depending on the provider (email and name are requested by default)>
+```
+
+Redirects to provider and then to `/callback`
+
+For apple specific setup see: https://github.com/supabase/gotrue#apple-oauth
 
 ### **GET /callback**
 
-  External provider should redirect to here
+External provider should redirect to here
 
-  Redirects to `<GOTRUE_SITE_URL>#access_token=<access_token>&refresh_token=<refresh_token>&provider_token=<provider_oauth_token>&expires_in=3600&provider=<provider_name>`
-  If additional scopes were requested then `provider_token` will be populated, you can use this to fetch additional data from the provider or interact with their services
+Redirects to `<GOTRUE_SITE_URL>#access_token=<access_token>&refresh_token=<refresh_token>&provider_token=<provider_oauth_token>&expires_in=3600&provider=<provider_name>`
+If additional scopes were requested then `provider_token` will be populated, you can use this to fetch additional data from the provider or interact with their services

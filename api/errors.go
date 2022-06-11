@@ -6,11 +6,17 @@ import (
 	"net/http"
 	"os"
 	"runtime/debug"
+
+	"github.com/netlify/gotrue/conf"
+	"github.com/netlify/gotrue/utilities"
+	"github.com/pkg/errors"
 )
 
 // Common error messages during signup flow
 var (
-	DuplicateEmailMsg = "A user with this email address has already been registered"
+	DuplicateEmailMsg       = "A user with this email address has already been registered"
+	DuplicatePhoneMsg       = "A user with this phone number has already been registered"
+	UserExistsError   error = errors.New("User already exists")
 )
 
 var oauthErrorMap = map[int]string{
@@ -56,6 +62,25 @@ func (e *OAuthError) Cause() error {
 	return e
 }
 
+func invalidPasswordLengthError(config *conf.Configuration) *HTTPError {
+	return unprocessableEntityError(fmt.Sprintf("Password should be at least %d characters", config.PasswordMinLength))
+}
+
+func invalidSignupError(config *conf.Configuration) *HTTPError {
+	var msg string
+	if config.External.Email.Enabled && config.External.Phone.Enabled {
+		msg = "To signup, please provide your email or phone number"
+	} else if config.External.Email.Enabled {
+		msg = "To signup, please provide your email"
+	} else if config.External.Phone.Enabled {
+		msg = "To signup, please provide your phone number"
+	} else {
+		// 3rd party OAuth signups
+		msg = "To signup, please provide required fields"
+	}
+	return unprocessableEntityError(msg)
+}
+
 func oauthError(err string, description string) *OAuthError {
 	return &OAuthError{Err: err, Description: description}
 }
@@ -77,7 +102,7 @@ func acceptedTokenError(fmtString string, args ...interface{}) *HTTPError {
 }
 
 func expiredTokenError(fmtString string, args ...interface{}) *HTTPError {
-	return httpError(http.StatusGone, fmtString, args...)
+	return httpError(http.StatusUnauthorized, fmtString, args...)
 }
 
 func unauthorizedError(fmtString string, args ...interface{}) *HTTPError {
@@ -110,6 +135,10 @@ func (e *HTTPError) Error() string {
 		return e.InternalMessage
 	}
 	return fmt.Sprintf("%d: %s", e.Code, e.Message)
+}
+
+func (e *HTTPError) Is(target error) bool {
+	return e.Error() == target.Error()
 }
 
 // Cause returns the root cause error
@@ -152,6 +181,18 @@ func (e *OTPError) Error() string {
 		return e.InternalMessage
 	}
 	return fmt.Sprintf("%s: %s", e.Err, e.Description)
+}
+
+// WithInternalError adds internal error information to the error
+func (e *OTPError) WithInternalError(err error) *OTPError {
+	e.InternalError = err
+	return e
+}
+
+// WithInternalMessage adds internal message information to the error
+func (e *OTPError) WithInternalMessage(fmtString string, args ...interface{}) *OTPError {
+	e.InternalMessage = fmt.Sprintf(fmtString, args...)
+	return e
 }
 
 // Cause returns the root cause error
@@ -209,10 +250,24 @@ func handleError(err error, w http.ResponseWriter, r *http.Request) {
 		} else {
 			log.WithError(e.Cause()).Info(e.Error())
 		}
+
+		// Provide better error messages for certain user-triggered Postgres errors.
+		if pgErr := utilities.NewPostgresError(e.InternalError); pgErr != nil {
+			if jsonErr := sendJSON(w, pgErr.HttpStatusCode, pgErr); jsonErr != nil {
+				handleError(jsonErr, w, r)
+			}
+			return
+		}
+
 		if jsonErr := sendJSON(w, e.Code, e); jsonErr != nil {
 			handleError(jsonErr, w, r)
 		}
 	case *OAuthError:
+		log.WithError(e.Cause()).Info(e.Error())
+		if jsonErr := sendJSON(w, http.StatusBadRequest, e); jsonErr != nil {
+			handleError(jsonErr, w, r)
+		}
+	case *OTPError:
 		log.WithError(e.Cause()).Info(e.Error())
 		if jsonErr := sendJSON(w, http.StatusBadRequest, e); jsonErr != nil {
 			handleError(jsonErr, w, r)

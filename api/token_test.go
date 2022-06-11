@@ -2,10 +2,12 @@ package api
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/gofrs/uuid"
 	"github.com/netlify/gotrue/conf"
@@ -20,8 +22,8 @@ type TokenTestSuite struct {
 	API    *API
 	Config *conf.Configuration
 
-	token      string
-	instanceID uuid.UUID
+	RefreshToken *models.RefreshToken
+	instanceID   uuid.UUID
 }
 
 func TestToken(t *testing.T) {
@@ -40,10 +42,22 @@ func TestToken(t *testing.T) {
 }
 
 func (ts *TokenTestSuite) SetupTest() {
+	ts.RefreshToken = nil
 	models.TruncateAll(ts.API.db)
+
+	// Create user & refresh token
+	u, err := models.NewUser(ts.instanceID, "12345678", "test@example.com", "password", ts.Config.JWT.Aud, nil)
+	require.NoError(ts.T(), err, "Error creating test user model")
+	t := time.Now()
+	u.EmailConfirmedAt = &t
+	u.BannedUntil = nil
+	require.NoError(ts.T(), ts.API.db.Create(u), "Error saving new test user")
+
+	ts.RefreshToken, err = models.GrantAuthenticatedUser(ts.API.db, u)
+	require.NoError(ts.T(), err, "Error creating refresh token")
 }
 
-func (ts *TokenTestSuite) TestRateLimitToken() {
+func (ts *TokenTestSuite) TestRateLimitTokenRefresh() {
 	var buffer bytes.Buffer
 	req := httptest.NewRequest(http.MethodPost, "http://localhost/token", &buffer)
 	req.Header.Set("Content-Type", "application/json")
@@ -72,4 +86,170 @@ func (ts *TokenTestSuite) TestRateLimitToken() {
 	w = httptest.NewRecorder()
 	ts.API.handler.ServeHTTP(w, req)
 	assert.Equal(ts.T(), http.StatusBadRequest, w.Code)
+}
+
+func (ts *TokenTestSuite) TestTokenPasswordGrantSuccess() {
+	var buffer bytes.Buffer
+	require.NoError(ts.T(), json.NewEncoder(&buffer).Encode(map[string]interface{}{
+		"email":    "test@example.com",
+		"password": "password",
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "http://localhost/token?grant_type=password", &buffer)
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	ts.API.handler.ServeHTTP(w, req)
+	assert.Equal(ts.T(), http.StatusOK, w.Code)
+}
+
+func (ts *TokenTestSuite) TestTokenRefreshTokenGrantSuccess() {
+	var buffer bytes.Buffer
+	require.NoError(ts.T(), json.NewEncoder(&buffer).Encode(map[string]interface{}{
+		"refresh_token": ts.RefreshToken.Token,
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "http://localhost/token?grant_type=refresh_token", &buffer)
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	ts.API.handler.ServeHTTP(w, req)
+	assert.Equal(ts.T(), http.StatusOK, w.Code)
+}
+
+func (ts *TokenTestSuite) TestTokenPasswordGrantFailure() {
+	u := ts.createBannedUser()
+
+	var buffer bytes.Buffer
+	require.NoError(ts.T(), json.NewEncoder(&buffer).Encode(map[string]interface{}{
+		"email":    u.GetEmail(),
+		"password": "password",
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "http://localhost/token?grant_type=password", &buffer)
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	ts.API.handler.ServeHTTP(w, req)
+	assert.Equal(ts.T(), http.StatusBadRequest, w.Code)
+}
+
+func (ts *TokenTestSuite) TestTokenRefreshTokenGrantFailure() {
+	_ = ts.createBannedUser()
+
+	var buffer bytes.Buffer
+	require.NoError(ts.T(), json.NewEncoder(&buffer).Encode(map[string]interface{}{
+		"refresh_token": ts.RefreshToken.Token,
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "http://localhost/token?grant_type=refresh_token", &buffer)
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	ts.API.handler.ServeHTTP(w, req)
+	assert.Equal(ts.T(), http.StatusBadRequest, w.Code)
+}
+
+func (ts *TokenTestSuite) TestTokenRefreshTokenRotation() {
+	u, err := models.NewUser(ts.instanceID, "", "foo@example.com", "password", ts.Config.JWT.Aud, nil)
+	require.NoError(ts.T(), err, "Error creating test user model")
+	t := time.Now()
+	u.EmailConfirmedAt = &t
+	require.NoError(ts.T(), ts.API.db.Create(u), "Error saving foo user")
+	first, err := models.GrantAuthenticatedUser(ts.API.db, u)
+	require.NoError(ts.T(), err)
+	second, err := models.GrantRefreshTokenSwap(ts.API.db, u, first)
+	require.NoError(ts.T(), err)
+	third, err := models.GrantRefreshTokenSwap(ts.API.db, u, second)
+	require.NoError(ts.T(), err)
+
+	cases := []struct {
+		desc                        string
+		refreshTokenRotationEnabled bool
+		reuseInterval               int
+		refreshToken                string
+		expectedCode                int
+		expectedBody                map[string]interface{}
+	}{
+		{
+			"Valid refresh within reuse interval",
+			true,
+			30,
+			second.Token,
+			http.StatusOK,
+			map[string]interface{}{
+				"refresh_token": third.Token,
+			},
+		},
+		{
+			"Invalid refresh, first token is not the previous revoked token",
+			true,
+			0,
+			first.Token,
+			http.StatusBadRequest,
+			map[string]interface{}{
+				"error":             "invalid_grant",
+				"error_description": "Invalid Refresh Token",
+			},
+		},
+		{
+			"Invalid refresh, revoked third token",
+			true,
+			0,
+			second.Token,
+			http.StatusBadRequest,
+			map[string]interface{}{
+				"error":             "invalid_grant",
+				"error_description": "Invalid Refresh Token",
+			},
+		},
+		{
+			"Invalid refresh, third token revoked by previous case",
+			true,
+			30,
+			third.Token,
+			http.StatusBadRequest,
+			map[string]interface{}{
+				"error":             "invalid_grant",
+				"error_description": "Invalid Refresh Token",
+			},
+		},
+	}
+
+	for _, c := range cases {
+		ts.Run(c.desc, func() {
+			ts.Config.Security.RefreshTokenRotationEnabled = c.refreshTokenRotationEnabled
+			ts.Config.Security.RefreshTokenReuseInterval = c.reuseInterval
+			var buffer bytes.Buffer
+			require.NoError(ts.T(), json.NewEncoder(&buffer).Encode(map[string]interface{}{
+				"refresh_token": c.refreshToken,
+			}))
+			req := httptest.NewRequest(http.MethodPost, "http://localhost/token?grant_type=refresh_token", &buffer)
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			ts.API.handler.ServeHTTP(w, req)
+			assert.Equal(ts.T(), c.expectedCode, w.Code)
+
+			data := make(map[string]interface{})
+			require.NoError(ts.T(), json.NewDecoder(w.Body).Decode(&data))
+			for k, v := range c.expectedBody {
+				require.Equal(ts.T(), v, data[k])
+			}
+		})
+	}
+}
+
+func (ts *TokenTestSuite) createBannedUser() *models.User {
+	u, err := models.NewUser(ts.instanceID, "", "banned@example.com", "password", ts.Config.JWT.Aud, nil)
+	require.NoError(ts.T(), err, "Error creating test user model")
+	t := time.Now()
+	u.EmailConfirmedAt = &t
+	t = t.Add(24 * time.Hour)
+	u.BannedUntil = &t
+	require.NoError(ts.T(), ts.API.db.Create(u), "Error saving new test banned user")
+
+	ts.RefreshToken, err = models.GrantAuthenticatedUser(ts.API.db, u)
+	require.NoError(ts.T(), err, "Error creating refresh token")
+
+	return u
 }

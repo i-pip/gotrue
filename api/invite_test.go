@@ -55,14 +55,12 @@ func (ts *InviteTestSuite) makeSuperAdmin(email string) string {
 		require.NoError(ts.T(), ts.API.db.Destroy(u), "Error deleting user")
 	}
 
-	u, err := models.NewUser(ts.instanceID, email, "test", ts.Config.JWT.Aud, map[string]interface{}{"full_name": "Test User"})
+	u, err := models.NewUser(ts.instanceID, "123456789", email, "test", ts.Config.JWT.Aud, map[string]interface{}{"full_name": "Test User"})
 	require.NoError(ts.T(), err, "Error making new user")
 
 	u.Role = "supabase_admin"
 
-	identities, err := models.FindIdentitiesByUser(ts.API.db, u)
-	require.NoError(ts.T(), err, "Error retrieving identities")
-	token, err := generateAccessToken(u, identities, time.Second*time.Duration(ts.Config.JWT.Exp), ts.Config.JWT.Secret)
+	token, err := generateAccessToken(u, time.Second*time.Duration(ts.Config.JWT.Exp), ts.Config.JWT.Secret)
 	require.NoError(ts.T(), err, "Error generating access token")
 
 	p := jwt.Parser{ValidMethods: []string{jwt.SigningMethodHS256.Name}}
@@ -147,7 +145,7 @@ func (ts *InviteTestSuite) TestVerifyInvite() {
 
 	for _, c := range cases {
 		ts.Run(c.desc, func() {
-			user, err := models.NewUser(ts.instanceID, c.email, "", ts.Config.JWT.Aud, nil)
+			user, err := models.NewUser(ts.instanceID, "", c.email, "", ts.Config.JWT.Aud, nil)
 			now := time.Now()
 			user.InvitedAt = &now
 			user.ConfirmationSentAt = &now
@@ -266,7 +264,8 @@ func (ts *InviteTestSuite) TestInviteExternalGitlab() {
 	ts.Require().NoError(err)
 	ts.Equal("Gitlab Test", user.UserMetaData["full_name"])
 	ts.Equal("http://example.com/avatar", user.UserMetaData["avatar_url"])
-	ts.Equal([]interface{}{"gitlab"}, user.AppMetaData["provider"])
+	ts.Equal("gitlab", user.AppMetaData["provider"])
+	ts.Equal([]interface{}{"gitlab"}, user.AppMetaData["providers"])
 }
 
 func (ts *InviteTestSuite) TestInviteExternalGitlab_MismatchedEmails() {

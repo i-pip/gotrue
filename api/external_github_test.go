@@ -5,8 +5,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"time"
 
 	jwt "github.com/golang-jwt/jwt"
+	"github.com/netlify/gotrue/models"
+	"github.com/stretchr/testify/require"
 )
 
 func (ts *ExternalTestSuite) TestSignupExternalGithub() {
@@ -47,7 +50,7 @@ func GitHubTestSignupSetup(ts *ExternalTestSuite, tokenCount *int, userCount *in
 		case "/api/v3/user":
 			*userCount++
 			w.Header().Add("Content-Type", "application/json")
-			fmt.Fprint(w, `{"id":"githubTestId", "name":"GitHub Test","avatar_url":"http://example.com/avatar"}`)
+			fmt.Fprint(w, `{"id":123, "name":"GitHub Test","avatar_url":"http://example.com/avatar"}`)
 		case "/api/v3/user/emails":
 			w.Header().Add("Content-Type", "application/json")
 			fmt.Fprint(w, emails)
@@ -71,7 +74,7 @@ func (ts *ExternalTestSuite) TestSignupExternalGitHub_AuthorizationCode() {
 
 	u := performAuthorization(ts, "github", code, "")
 
-	assertAuthorizationSuccess(ts, u, tokenCount, userCount, "github@example.com", "GitHub Test", "githubTestId", "http://example.com/avatar")
+	assertAuthorizationSuccess(ts, u, tokenCount, userCount, "github@example.com", "GitHub Test", "123", "http://example.com/avatar")
 }
 
 func (ts *ExternalTestSuite) TestSignupExternalGitHubDisableSignupErrorWhenNoUser() {
@@ -103,7 +106,7 @@ func (ts *ExternalTestSuite) TestSignupExternalGitHubDisableSignupErrorWhenEmpty
 func (ts *ExternalTestSuite) TestSignupExternalGitHubDisableSignupSuccessWithPrimaryEmail() {
 	ts.Config.DisableSignup = true
 
-	ts.createUser("githubTestId", "github@example.com", "GitHub Test", "http://example.com/avatar", "")
+	ts.createUser("123", "github@example.com", "GitHub Test", "http://example.com/avatar", "")
 
 	tokenCount, userCount := 0, 0
 	code := "authcode"
@@ -113,13 +116,13 @@ func (ts *ExternalTestSuite) TestSignupExternalGitHubDisableSignupSuccessWithPri
 
 	u := performAuthorization(ts, "github", code, "")
 
-	assertAuthorizationSuccess(ts, u, tokenCount, userCount, "github@example.com", "GitHub Test", "githubTestId", "http://example.com/avatar")
+	assertAuthorizationSuccess(ts, u, tokenCount, userCount, "github@example.com", "GitHub Test", "123", "http://example.com/avatar")
 }
 
 func (ts *ExternalTestSuite) TestSignupExternalGitHubDisableSignupSuccessWithNonPrimaryEmail() {
 	ts.Config.DisableSignup = true
 
-	ts.createUser("githubTestId", "secondary@example.com", "GitHub Test", "http://example.com/avatar", "")
+	ts.createUser("123", "secondary@example.com", "GitHub Test", "http://example.com/avatar", "")
 
 	tokenCount, userCount := 0, 0
 	code := "authcode"
@@ -129,12 +132,12 @@ func (ts *ExternalTestSuite) TestSignupExternalGitHubDisableSignupSuccessWithNon
 
 	u := performAuthorization(ts, "github", code, "")
 
-	assertAuthorizationSuccess(ts, u, tokenCount, userCount, "secondary@example.com", "GitHub Test", "githubTestId", "http://example.com/avatar")
+	assertAuthorizationSuccess(ts, u, tokenCount, userCount, "secondary@example.com", "GitHub Test", "123", "http://example.com/avatar")
 }
 
 func (ts *ExternalTestSuite) TestInviteTokenExternalGitHubSuccessWhenMatchingToken() {
 	// name and avatar should be populated from GitHub API
-	ts.createUser("githubTestId", "github@example.com", "", "", "invite_token")
+	ts.createUser("123", "github@example.com", "", "", "invite_token")
 
 	tokenCount, userCount := 0, 0
 	code := "authcode"
@@ -144,7 +147,7 @@ func (ts *ExternalTestSuite) TestInviteTokenExternalGitHubSuccessWhenMatchingTok
 
 	u := performAuthorization(ts, "github", code, "invite_token")
 
-	assertAuthorizationSuccess(ts, u, tokenCount, userCount, "github@example.com", "GitHub Test", "githubTestId", "http://example.com/avatar")
+	assertAuthorizationSuccess(ts, u, tokenCount, userCount, "github@example.com", "GitHub Test", "123", "http://example.com/avatar")
 }
 
 func (ts *ExternalTestSuite) TestInviteTokenExternalGitHubErrorWhenNoMatchingToken() {
@@ -159,7 +162,7 @@ func (ts *ExternalTestSuite) TestInviteTokenExternalGitHubErrorWhenNoMatchingTok
 }
 
 func (ts *ExternalTestSuite) TestInviteTokenExternalGitHubErrorWhenWrongToken() {
-	ts.createUser("githubTestId", "github@example.com", "", "", "invite_token")
+	ts.createUser("123", "github@example.com", "", "", "invite_token")
 
 	tokenCount, userCount := 0, 0
 	code := "authcode"
@@ -172,7 +175,7 @@ func (ts *ExternalTestSuite) TestInviteTokenExternalGitHubErrorWhenWrongToken() 
 }
 
 func (ts *ExternalTestSuite) TestInviteTokenExternalGitHubErrorWhenEmailDoesntMatch() {
-	ts.createUser("githubTestId", "github@example.com", "", "", "invite_token")
+	ts.createUser("123", "github@example.com", "", "", "invite_token")
 
 	tokenCount, userCount := 0, 0
 	code := "authcode"
@@ -183,4 +186,41 @@ func (ts *ExternalTestSuite) TestInviteTokenExternalGitHubErrorWhenEmailDoesntMa
 	u := performAuthorization(ts, "github", code, "invite_token")
 
 	assertAuthorizationFailure(ts, u, "Invited email does not match emails from external provider", "invalid_request", "")
+}
+
+func (ts *ExternalTestSuite) TestSignupExternalGitHubErrorWhenVerifiedFalse() {
+	tokenCount, userCount := 0, 0
+	code := "authcode"
+	emails := `[{"email":"github@example.com", "primary": true, "verified": false}]`
+	server := GitHubTestSignupSetup(ts, &tokenCount, &userCount, code, emails)
+	defer server.Close()
+
+	u := performAuthorization(ts, "github", code, "")
+
+	v, err := url.ParseQuery(u.Fragment)
+	ts.Require().NoError(err)
+	ts.Equal("unauthorized_client", v.Get("error"))
+	ts.Equal("401", v.Get("error_code"))
+	ts.Equal("Unverified email with github", v.Get("error_description"))
+	assertAuthorizationFailure(ts, u, "", "", "")
+}
+
+func (ts *ExternalTestSuite) TestSignupExternalGitHubErrorWhenUserBanned() {
+	tokenCount, userCount := 0, 0
+	code := "authcode"
+	emails := `[{"email":"github@example.com", "primary": true, "verified": true}]`
+	server := GitHubTestSignupSetup(ts, &tokenCount, &userCount, code, emails)
+	defer server.Close()
+
+	u := performAuthorization(ts, "github", code, "")
+	assertAuthorizationSuccess(ts, u, tokenCount, userCount, "github@example.com", "GitHub Test", "123", "http://example.com/avatar")
+
+	user, err := models.FindUserByEmailAndAudience(ts.API.db, ts.instanceID, "github@example.com", ts.Config.JWT.Aud)
+	require.NoError(ts.T(), err)
+	t := time.Now().Add(24 * time.Hour)
+	user.BannedUntil = &t
+	require.NoError(ts.T(), ts.API.db.UpdateOnly(user, "banned_until"))
+
+	u = performAuthorization(ts, "github", code, "")
+	assertAuthorizationFailure(ts, u, "User is unauthorized", "unauthorized_client", "")
 }
